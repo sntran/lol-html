@@ -1,0 +1,87 @@
+name: Sync, Build, and Publish
+
+on:
+  workflow_run:
+    workflows: ["CI"] # Replace "CI" with the exact name of the test workflow
+    types: [completed]
+  schedule:
+    - cron: '0 0 * * *' # Daily at midnight
+  workflow_dispatch:    # Manual trigger
+
+jobs:
+  # 1. First, ensure the triggering workflow was successful
+  ci:
+    runs-on: ubuntu-latest
+    if: >
+      github.event_name == 'workflow_dispatch' || 
+      github.event_name == 'schedule' || 
+      (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success')
+    steps:
+      - run: echo "CI passed, proceeding to sync and build."
+
+  sync:
+    needs: ci
+    runs-on: ubuntu-latest
+    outputs:
+      updated: ${{ steps.check.outputs.updated }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Merge Upstream
+        id: check
+        run: |
+          git config user.name "github-actions"
+          git config user.email "github-actions@github.com"
+          git remote add upstream https://github.com/cloudflare/lol-html.git
+          git fetch upstream
+          
+          if git merge upstream/main --no-edit --allow-unrelated-histories; then
+            if [ "$(git rev-parse HEAD)" != "$(git rev-parse @{1})" ]; then
+              git push origin main
+              echo "updated=true" >> $GITHUB_OUTPUT
+            else
+              echo "updated=false" >> $GITHUB_OUTPUT
+            fi
+          else
+            exit 1 # Fail if there are conflicts
+          fi
+
+  build-and-publish:
+    needs: sync
+    # This is the "Short-Circuit":
+    # The job only runs if the sync job confirmed an update occurred.
+    if: needs.sync.outputs.updated == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          key: index-${{ hashFiles('Cargo.toml') }}
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+
+      - name: Fetch dependencies
+        run: cargo fetch
+
+      - name: Cache target directory
+        uses: actions/cache@v4
+        with:
+          key: target-${{ hashFiles('Cargo.lock') }}
+          path: target
+
+      - uses: actions/setup-node@v4
+
+      - name: Build
+        run: wasm-pack build js-api --target nodejs --scope sntran --release
+
+      - name: Upload Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: lol-html.js
+          path: js-api/pkg
