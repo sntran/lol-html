@@ -1,0 +1,181 @@
+name: Sync, Build, and Publish
+
+on:
+  schedule:
+    - cron: '0 0 * * *' # Daily at midnight
+  workflow_dispatch:    # Manual trigger
+
+jobs:
+  # 1. Sync first to see if we even have changes
+  sync:
+    runs-on: ubuntu-latest
+    outputs:
+      updated: ${{ steps.sync.outputs.updated }}
+      tag: ${{ steps.sync.outputs.tag }}
+      sha: ${{ steps.sync.outputs.sha }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # This is critical: fetch all history so merge-base works
+          fetch-depth: 0
+          fetch-tags: true # Explicitly pull tags
+
+      - name: Sync and Rebase
+        id: sync
+        run: |
+          # 1. Initialize output to false by default
+          echo "updated=false" >> $GITHUB_OUTPUT
+
+          git config user.name "github-actions"
+          git config user.email "github-actions@github.com"
+          git remote add upstream https://github.com/cloudflare/lol-html.git
+          git fetch upstream
+
+          echo "Fetched tags from upstream"
+
+          # Find latest upstream tag and its commit SHA
+          LATEST_TAG=$(git ls-remote --tags upstream | cut -d/ -f3- | sed 's/\^{}//' | sort -V | tail -n1)
+          LATEST_SHA=$(git ls-remote --tags upstream "$LATEST_TAG" | cut -f1)
+
+          echo "tag=$LATEST_TAG" >> $GITHUB_OUTPUT
+          echo "sha=$LATEST_SHA" >> $GITHUB_OUTPUT
+
+          # Get parent commit of HEAD (should be the synced tag commit if up to date)
+          PARENT_SHA=$(git rev-parse HEAD^)
+
+          echo "Latest upstream tag: $LATEST_TAG ($LATEST_SHA)"
+          echo "Current parent commit: $PARENT_SHA"
+
+          if [ "$LATEST_SHA" = "$PARENT_SHA" ]; then
+            echo "Already at latest upstream tag: $LATEST_TAG ($LATEST_SHA)"
+            echo "updated=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          # Only if tags differ, rebase current HEAD (which includes your workflow commit) 
+          # onto the tip of upstream/main
+          git rebase upstream/main --onto upstream/main
+
+          # Force push the result
+          git push origin HEAD:main --force
+
+          echo "updated=true" >> $GITHUB_OUTPUT
+
+  build-and-publish:
+    needs: sync
+    # This is the "Short-Circuit":
+    # The job only runs if the sync job confirmed an update occurred.
+    if: ${{ needs.sync.outputs.updated == 'true' || github.event_name == 'workflow_dispatch' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          # This is critical: fetch all history so merge-base works
+          fetch-depth: 0
+          fetch-tags: true # Explicitly pull tags
+
+      # CRITICAL: Switch the code to the tag, but keep our workflow
+      # We use 'git checkout' on the tag for the files, but the runner 
+      # continues using the workflow definition from the current run.
+      - name: Checkout Tagged Code
+        run: |
+          RELEASE_TAG=${{ needs.sync.outputs.tag }}
+          RELEASE_SHA=${{ needs.sync.outputs.sha }}
+          git reset --hard $RELEASE_SHA
+          # Restore the js-api/ directory to exactly what the tag says
+          # This ensures package.json matches the tag version.
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          key: index-${{ hashFiles('Cargo.toml') }}
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+
+      - name: Fetch dependencies
+        run: cargo fetch
+
+      - name: Cache target directory
+        uses: actions/cache@v4
+        with:
+          key: target-${{ hashFiles('Cargo.lock') }}
+          path: target
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+          registry-url: "https://registry.npmjs.org"
+
+      - name: wasm-pack install
+        run: npm i -g wasm-pack
+
+      - name: Release JS API
+        run: |
+          rm -rf js-api/pkg
+          wasm-pack build js-api --target nodejs --scope sntran --release
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "Cargo.toml version in js-api:"
+          grep '^version' js-api/Cargo.toml
+
+          echo "package.json version in js-api:"
+          cat js-api/pkg/package.json | grep '"version"'
+
+          # Use the tag passed from the sync job
+          RELEASE_TAG=${{ needs.sync.outputs.tag }}
+
+          if [ -z "$RELEASE_TAG" ]; then
+            RELEASE_TAG=$(git describe --tags --abbrev=0)
+          fi
+
+          echo "Using release tag: $RELEASE_TAG"
+
+          # Get the current commit SHA
+          CURRENT_SHA=$(git rev-parse HEAD)
+          
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            echo "Release $RELEASE_TAG already exists. Skipping creation."
+            exit 0
+          fi
+
+          RELEASE_NOTES=$(gh release view "$RELEASE_TAG" --repo cloudflare/lol-html --json body --template '{{.body}}')
+
+          # Package the artifacts
+          # Note: wasm-pack typically outputs package.json in the pkg folder
+          cd js-api/pkg
+          npm pack
+
+          # Find the scope-prefixed file and rename it
+          # This assumes there is only one .tgz file in the directory
+          mv sntran-lol-html-*.tgz lol-html-${{ needs.sync.outputs.tag }}.tgz
+          
+          gh release create "$RELEASE_TAG" \
+            --title "$RELEASE_TAG" \
+            --notes "$RELEASE_NOTES" \
+            --target "$CURRENT_SHA" \
+            *.tgz
+
+      - name: Publish to NPM
+        run: |
+          cd js-api/pkg
+          npm publish --access public || echo "Version already exists on NPM, skipping."
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - uses: actions/setup-node@v6
+        with:
+          registry-url: 'https://npm.pkg.github.com'
+
+      - name: Publish to GitHub Package Registry
+        run: |
+          cd js-api/pkg
+          npm publish --access public || echo "Version already exists on GHR, skipping."
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
